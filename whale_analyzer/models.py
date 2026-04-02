@@ -48,15 +48,12 @@ class WalletProfile:
         return [t for t in self.trades if t.outcome in ("WIN", "LOSS")]
 
     @property
-    def win_count(self) -> int:
-        return sum(1 for t in self.resolved_trades if t.outcome == "WIN")
-
-    @property
     def win_rate(self) -> float:
         rt = self.resolved_trades
         if not rt:
             return 0.0
-        return self.win_count / len(rt)
+        wins = sum(1 for t in rt if t.outcome == "WIN")
+        return wins / len(rt)
 
     @property
     def total_pnl(self) -> float:

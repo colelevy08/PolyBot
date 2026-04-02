@@ -91,6 +91,6 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         console.print("\n[yellow]Interrupted by user.[/]")
         sys.exit(0)
-    except Exception as exc:
+    except Exception:
         console.print_exception()
         sys.exit(1)

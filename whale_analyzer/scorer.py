@@ -38,10 +38,6 @@ assert abs(sum(_WEIGHTS.values()) - 1.0) < 1e-9, "Weights must sum to 1.0"
 _90_DAYS_MS = 90 * 24 * 3600 * 1000
 
 
-def _safe_div(a: float, b: float, default: float = 0.0) -> float:
-    return a / b if b != 0 else default
-
-
 def _compute_profit_factor(trades: list[TradeRecord]) -> float:
     gross_profit = sum(t.pnl for t in trades if t.pnl is not None and t.pnl > 0)
     gross_loss = abs(sum(t.pnl for t in trades if t.pnl is not None and t.pnl < 0))

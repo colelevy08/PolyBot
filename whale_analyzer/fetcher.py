@@ -129,6 +129,7 @@ class WhaleFetcher:
         """
         logger.info("Fetching top %d wallet addresses from leaderboard...", limit)
         addresses: list[str] = []
+        seen: set[str] = set()   # O(1) membership test; list search is O(n²) at 10k
         page_size = 100
         offset = 0
 
@@ -159,8 +160,9 @@ class WhaleFetcher:
 
             for row in rows:
                 addr = row.get("proxy_wallet_address") or row.get("address") or row.get("user")
-                if addr and addr not in addresses:
+                if addr and addr not in seen:
                     addresses.append(addr)
+                    seen.add(addr)
 
             offset += len(rows)
             if len(rows) < fetch_n:
