@@ -4,9 +4,7 @@ All modules import from here; no raw os.getenv calls elsewhere.
 """
 from __future__ import annotations
 
-import os
 from functools import lru_cache
-from typing import Optional
 
 from dotenv import load_dotenv
 from pydantic import Field

@@ -21,8 +21,6 @@ from __future__ import annotations
 import logging
 import time
 
-import orjson
-
 from config import cfg
 from whale_analyzer.fetcher import WhaleFetcher
 from whale_analyzer.models import EdgeResult, WhaleSignal

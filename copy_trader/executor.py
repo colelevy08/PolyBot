@@ -20,7 +20,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from typing import Any
 
 import aiohttp
 import orjson
@@ -61,6 +60,24 @@ class TradeExecutor:
         # Simple in-process dedup: token_id → last signal ts (ms)
         self._last_signal: dict[str, int] = {}
 
+        # Pre-instantiate ClobClient once (not per-order) to reuse its session.
+        # Falls back to None if py_clob_client is not installed.
+        self._clob_client = None
+        if cfg.poly_api_key:
+            try:
+                from py_clob_client.client import ClobClient
+                self._clob_client = ClobClient(
+                    host=cfg.clob_url,
+                    chain_id=cfg.chain_id,
+                    private_key=cfg.poly_private_key,
+                    api_key=cfg.poly_api_key,
+                    api_secret=cfg.poly_api_secret,
+                    api_passphrase=cfg.poly_api_passphrase,
+                )
+                logger.info("ClobClient initialised.")
+            except ImportError:
+                logger.info("py_clob_client not installed — will use raw HTTP fallback.")
+
     def attach_session(self, session: aiohttp.ClientSession) -> None:
         """Called after the aiohttp session is ready."""
         self._session = session
@@ -69,7 +86,15 @@ class TradeExecutor:
         """
         Entry point called by WhaleWatcher for every whale trade.
         This runs on the asyncio event loop — must not block.
+
+        Only BUY signals are copied. SELL signals would require the complementary
+        NO token ID (a different contract address not present in WhaleSignal), so
+        they are skipped to avoid placing orders on the wrong token.
         """
+        if signal.side != "BUY":
+            logger.debug("Skipping SELL signal for %s (no NO token ID available)", signal.token_id)
+            return
+
         token_id = signal.token_id
 
         # ── Fast dedup check ──────────────────────────────────────────────────
@@ -97,12 +122,9 @@ class TradeExecutor:
     async def _place_order(self, signal: WhaleSignal, edge: EdgeResult) -> None:
         """
         Build, sign, and POST a limit order to the CLOB.
-        Uses py-clob-client for signing if credentials are set,
-        otherwise falls back to raw unsigned POST (test mode).
+        Uses pre-instantiated ClobClient if available, otherwise raw HTTP fallback.
         """
-        fired_ts = int(time.time() * 1000)
-
-        order_side = "BUY" if signal.side == "BUY" else "BUY"  # always copy direction
+        order_side = signal.side  # already validated as "BUY" in handle_signal
         size = edge.bet_size_usdc
 
         if size < 1.0:
@@ -161,19 +183,11 @@ class TradeExecutor:
             )
             return f"test_{token_id[:8]}_{int(time.time())}"
 
-        # ── Use py-clob-client if available ───────────────────────────────────
-        try:
-            from py_clob_client.client import ClobClient
+        if self._clob_client is not None:
+            # ── Pre-instantiated ClobClient path ─────────────────────────────
+            # client.create_order / post_order are synchronous (uses requests).
+            # Run them in a thread executor so we don't block the event loop.
             from py_clob_client.clob_types import OrderArgs, OrderType
-
-            client = ClobClient(
-                host=cfg.clob_url,
-                chain_id=cfg.chain_id,
-                private_key=cfg.poly_private_key,
-                api_key=cfg.poly_api_key,
-                api_secret=cfg.poly_api_secret,
-                api_passphrase=cfg.poly_api_passphrase,
-            )
 
             order_args = OrderArgs(
                 token_id=token_id,
@@ -181,34 +195,37 @@ class TradeExecutor:
                 size=size_usdc / price,   # convert USDC to shares
                 side=side,
             )
-            signed_order = client.create_order(order_args)
-            resp = client.post_order(signed_order, OrderType.GTC)
-            order_id = resp.get("orderID", resp.get("id", ""))
-            return str(order_id)
+            loop = asyncio.get_running_loop()
+            signed_order = await loop.run_in_executor(
+                None, self._clob_client.create_order, order_args
+            )
+            resp = await loop.run_in_executor(
+                None, self._clob_client.post_order, signed_order, OrderType.GTC
+            )
+            return str(resp.get("orderID", resp.get("id", "")))
 
-        except ImportError:
-            # ── Fallback: raw CLOB POST (unsigned — requires API key header) ──
-            assert self._session is not None, "HTTP session not attached"
-            payload = {
-                "tokenID": token_id,
-                "side": side,
-                "price": str(round(price, 4)),
-                "size": str(round(size_usdc / price, 2)),
-                "feeRateBps": "0",
-                "nonce": str(int(time.time() * 1000)),
-                "type": "GTC",
-            }
-            headers = {
-                "POLY-API-KEY": cfg.poly_api_key,
-                "POLY-API-SECRET": cfg.poly_api_secret,
-                "POLY-API-PASSPHRASE": cfg.poly_api_passphrase,
-                "Content-Type": "application/json",
-            }
-            async with self._session.post(
-                f"{cfg.clob_url}/order",
-                data=orjson.dumps(payload),
-                headers=headers,
-            ) as resp:
-                resp.raise_for_status()
-                data = orjson.loads(await resp.read())
-                return str(data.get("orderID", data.get("id", "")))
+        # ── Fallback: raw CLOB POST via aiohttp (async, no blocking) ─────────
+        assert self._session is not None, "HTTP session not attached"
+        payload = {
+            "tokenID": token_id,
+            "side": side,
+            "price": str(round(price, 4)),
+            "size": str(round(size_usdc / price, 2)),
+            "feeRateBps": "0",
+            "nonce": str(int(time.time() * 1000)),
+            "type": "GTC",
+        }
+        headers = {
+            "POLY-API-KEY": cfg.poly_api_key,
+            "POLY-API-SECRET": cfg.poly_api_secret,
+            "POLY-API-PASSPHRASE": cfg.poly_api_passphrase,
+            "Content-Type": "application/json",
+        }
+        async with self._session.post(
+            f"{cfg.clob_url}/order",
+            data=orjson.dumps(payload),
+            headers=headers,
+        ) as resp:
+            resp.raise_for_status()
+            data = orjson.loads(await resp.read())
+            return str(data.get("orderID", data.get("id", "")))

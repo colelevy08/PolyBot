@@ -17,8 +17,6 @@ from __future__ import annotations
 import logging
 import math
 import time
-from typing import Sequence
-
 import numpy as np
 
 from whale_analyzer.models import TradeRecord, WalletProfile, WalletScore
@@ -37,7 +35,6 @@ _WEIGHTS = {
 }
 assert abs(sum(_WEIGHTS.values()) - 1.0) < 1e-9, "Weights must sum to 1.0"
 
-_NOW_MS = int(time.time() * 1000)
 _90_DAYS_MS = 90 * 24 * 3600 * 1000
 
 
@@ -64,7 +61,8 @@ def _compute_sharpe(pnls: np.ndarray) -> float:
 
 def _compute_recency(profile: WalletProfile) -> float:
     """0–1: fraction of trades in last 90 days."""
-    recent = sum(1 for t in profile.trades if (_NOW_MS - t.timestamp) < _90_DAYS_MS)
+    now_ms = int(time.time() * 1000)  # always current, not stale from import time
+    recent = sum(1 for t in profile.trades if (now_ms - t.timestamp) < _90_DAYS_MS)
     total = max(profile.trade_count, 1)
     return recent / total
 

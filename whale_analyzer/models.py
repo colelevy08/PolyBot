@@ -68,21 +68,15 @@ class WalletScore:
     """
     Composite score for ranking wallets.
     Higher is better across all metrics.
+
+    Note: __slots__ intentionally omitted here. Mixing __slots__ with a
+    dataclass that has a default-valued field (rank: int = 0) causes the
+    dataclass decorator to overwrite the slot descriptor with the default
+    integer, leaving instances with no slot and no __dict__ → AttributeError
+    on first assignment. WalletScore is not on a hot path so __dict__ overhead
+    is acceptable. Hot-path classes (TradeRecord, WhaleSignal, EdgeResult)
+    still use __slots__ correctly because they have no default values.
     """
-    __slots__ = (
-        "address",
-        "composite_score",
-        "win_rate",
-        "profit_factor",
-        "expected_value_per_trade",
-        "sharpe_ratio",
-        "trade_count",
-        "total_pnl_usdc",
-        "recency_weight",
-        "avg_edge",
-        "category_breakdown",
-        "rank",
-    )
     address: str
     composite_score: float      # Final ranking score (higher = better)
     win_rate: float             # % of resolved trades that were winners

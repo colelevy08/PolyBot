@@ -37,7 +37,6 @@ from typing import Any
 
 import orjson
 import websockets
-from websockets.exceptions import ConnectionClosed
 
 from config import cfg
 from whale_analyzer.models import WhaleSignal
