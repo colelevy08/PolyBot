@@ -49,14 +49,23 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-async def _stats_loop(order_manager: OrderManager, interval: float = 60.0) -> None:
-    """Logs position summary every `interval` seconds. Exits cleanly on cancel."""
+async def _stats_loop(
+    order_manager: OrderManager,
+    executor: TradeExecutor,
+    interval: float = 60.0,
+) -> None:
+    """
+    Logs position summary and refreshes live bankroll every `interval` seconds.
+    Exits cleanly on cancel.
+    """
     try:
         while True:
             await asyncio.sleep(interval)
+            bankroll = await executor.sync_bankroll()
             summary = order_manager.summary()
             logger.info(
-                "[STATS] open=%d closed=%d pnl=$%.2f win_rate=%.1f%%",
+                "[STATS] bankroll=$%.2f  open=%d  closed=%d  pnl=$%.2f  win_rate=%.1f%%",
+                bankroll,
                 summary["open_positions"],
                 summary["closed_positions"],
                 summary["total_pnl_usdc"],
@@ -90,6 +99,10 @@ async def _main() -> None:
         # Give executor a reference to the shared HTTP session
         executor.attach_session(fetcher._session)
 
+        # Fetch live balance and set bankroll before the bot starts trading
+        opening_balance = await executor.sync_bankroll()
+        console.print(f"[green]Polymarket balance: ${opening_balance:,.2f} USDC[/]")
+
         watcher = WhaleWatcher(
             whale_addresses=whale_addresses,
             on_signal=executor.handle_signal,
@@ -115,7 +128,7 @@ async def _main() -> None:
         main_task = asyncio.ensure_future(
             asyncio.gather(
                 watcher.run(),
-                _stats_loop(order_manager),
+                _stats_loop(order_manager, executor),
                 return_exceptions=True,
             )
         )

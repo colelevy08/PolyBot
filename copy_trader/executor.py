@@ -82,6 +82,46 @@ class TradeExecutor:
         """Called after the aiohttp session is ready."""
         self._session = session
 
+    async def sync_bankroll(self) -> float:
+        """
+        Fetch live USDC balance from Polymarket and update the bankroll used
+        for Kelly sizing. Called at startup and refreshed every stats cycle.
+
+        Falls back to cfg.bankroll_usdc if credentials are missing or the
+        call fails, so the bot can still run in test mode without credentials.
+        """
+        if self._clob_client is None:
+            logger.debug("No CLOB client — keeping bankroll at $%.2f", self._bankroll)
+            return self._bankroll
+
+        try:
+            loop = asyncio.get_running_loop()
+            raw = await loop.run_in_executor(None, self._clob_client.get_balance)
+
+            # get_balance() returns a string like "150.23" or a dict;
+            # normalise to float
+            if isinstance(raw, dict):
+                usdc = float(raw.get("balance", raw.get("usdc", 0)))
+            else:
+                usdc = float(raw)
+
+            if usdc <= 0:
+                logger.warning(
+                    "Balance returned $%.2f — keeping previous bankroll $%.2f",
+                    usdc, self._bankroll,
+                )
+                return self._bankroll
+
+            old = self._bankroll
+            self._bankroll = usdc
+            self._scanner._bankroll = usdc  # keep edge scanner in sync
+            logger.info("Bankroll synced: $%.2f → $%.2f", old, usdc)
+            return usdc
+
+        except Exception as exc:
+            logger.warning("Balance fetch failed (%s) — keeping $%.2f", exc, self._bankroll)
+            return self._bankroll
+
     async def handle_signal(self, signal: WhaleSignal) -> None:
         """
         Entry point called by WhaleWatcher for every whale trade.
