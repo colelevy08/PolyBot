@@ -110,12 +110,21 @@ class OrderManager:
             return
 
         # Calculate P&L
+        # size_usdc is the USDC notional spent (the bet amount).
+        # For a binary market BUY at price p, you buy (size_usdc / p) shares.
+        # WIN: each share pays $1 → profit = shares * (1 - p) = size_usdc * (1-p)/p
+        # LOSS: shares pay $0 → loss = -size_usdc (all invested capital lost)
         if resolved_yes is not None:
-            # Binary resolution
             if order.side == "BUY":
-                pnl = order.size_usdc * (1.0 - order.price) if resolved_yes else -order.size_usdc * order.price
-            else:
-                pnl = order.size_usdc * order.price if not resolved_yes else -order.size_usdc * (1.0 - order.price)
+                if resolved_yes:
+                    pnl = order.size_usdc * (1.0 - order.price) / order.price
+                else:
+                    pnl = -order.size_usdc
+            else:  # SELL (selling YES = buying NO equivalent)
+                if not resolved_yes:
+                    pnl = order.size_usdc * order.price / (1.0 - order.price)
+                else:
+                    pnl = -order.size_usdc
             ep = 1.0 if resolved_yes else 0.0
         elif exit_price is not None:
             # Manual exit

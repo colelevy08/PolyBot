@@ -364,12 +364,22 @@ class WhaleFetcher:
         """
         Fetch a single CLOB market by condition_id.
         Returns the market dict (includes tokens[].winner for resolution) or None.
+
+        Endpoint: GET /markets?condition_id=<id>  (not /markets/{id} — that path
+        doesn't exist on the CLOB). The response is a list; we return the first item.
         """
         try:
             data = await self._get_json(
-                f"{cfg.clob_url}/markets/{condition_id}",
+                f"{cfg.clob_url}/markets",
+                params={"condition_id": condition_id},
             )
-            return data if isinstance(data, dict) else None
+            # /markets returns a paginated object: {"data": [...], "next_cursor": "..."}
+            markets: list[dict] = []
+            if isinstance(data, list):
+                markets = data
+            elif isinstance(data, dict):
+                markets = data.get("data", data.get("markets", []))
+            return markets[0] if markets else None
         except Exception as exc:
             logger.debug("get_clob_market failed for %s: %s", condition_id, exc)
             return None

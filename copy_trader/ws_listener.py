@@ -169,5 +169,10 @@ class WhaleWatcher:
             if trade_ts > latest_ts:
                 latest_ts = trade_ts
 
-        # Advance cursor past the last trade we processed
-        self._last_ts[address] = latest_ts
+        # Advance cursor. We subtract 1 second so that trades sharing the same
+        # integer second as latest_ts are re-fetched on the next poll.  The
+        # executor's _DEDUP_WINDOW_MS (2 000 ms) prevents double-ordering on
+        # re-seen trades, so the only cost is one extra API call per whale that
+        # traded in the final second — acceptable to avoid permanently missing
+        # a concurrent trade that shares the same match_time second.
+        self._last_ts[address] = max(0, latest_ts - 1)

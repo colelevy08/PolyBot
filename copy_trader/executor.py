@@ -23,7 +23,6 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 
 import aiohttp
-import orjson
 
 from config import cfg
 from edge_scanner.scanner import EdgeScanner
@@ -266,31 +265,15 @@ class TradeExecutor:
             )
             return str(resp.get("orderID", resp.get("id", "")))
 
-        # ── Fallback: raw CLOB POST via aiohttp (async, no blocking) ─────────
-        assert self._session is not None, "HTTP session not attached"
-        payload = {
-            "tokenID": token_id,
-            "side": side,
-            "price": str(round(price, 4)),
-            "size": str(round(size_usdc / price, 2)),
-            "feeRateBps": "0",
-            "nonce": str(int(time.time() * 1000)),
-            "type": "GTC",
-        }
-        headers = {
-            "POLY-API-KEY": cfg.poly_api_key,
-            "POLY-API-SECRET": cfg.poly_api_secret,
-            "POLY-API-PASSPHRASE": cfg.poly_api_passphrase,
-            "Content-Type": "application/json",
-        }
-        async with self._session.post(
-            f"{cfg.clob_url}/order",
-            data=orjson.dumps(payload),
-            headers=headers,
-        ) as resp:
-            resp.raise_for_status()
-            data = orjson.loads(await resp.read())
-            return str(data.get("orderID", data.get("id", "")))
+        # py-clob-client is required for order signing.
+        # The CLOB POST /order endpoint requires a cryptographically signed order
+        # (EIP-712 signature over the full order struct).  Constructing a valid
+        # signed order without the SDK is non-trivial and out of scope.
+        # Install py-clob-client:  pip install py-clob-client>=0.16.0
+        raise RuntimeError(
+            "py_clob_client is required to place orders. "
+            "Install it with: pip install py-clob-client>=0.16.0"
+        )
 
     async def _confirm_fill(self, order_id: str, token_id: str) -> None:
         """

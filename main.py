@@ -8,11 +8,12 @@ Prerequisites:
   - .env must be populated with CLOB credentials
 
 Pipeline:
-  1. Load top whale addresses from data/whales.json.
+  1. Load top whale addresses from data/whales.json (re-analyse if stale).
   2. Initialise aiohttp session, EdgeScanner, TradeExecutor, OrderManager.
-  3. WhaleWatcher opens a persistent WebSocket to Polymarket CLOB.
-  4. On each whale trade → EdgeScanner → Kelly size → CLOB order.
-  5. Periodic stats logged every 60 seconds.
+  3. WhalePollWatcher polls /data/trades for each whale every 2s.
+  4. On each new whale trade → EdgeScanner (live orderbook) → Kelly size → CLOB order.
+  5. PositionMonitor polls CLOB /markets every 5min for resolution.
+  6. Stats logged every 60 seconds; state persisted on shutdown.
 """
 from __future__ import annotations
 
