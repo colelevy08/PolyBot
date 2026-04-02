@@ -128,6 +128,7 @@ async def _main() -> None:
             whale_addresses=whale_addresses,
             on_signal=executor.handle_signal,
         )
+        watcher.attach_fetcher(fetcher)
         position_monitor = PositionMonitor(fetcher=fetcher, order_manager=order_manager)
 
         # ── Graceful shutdown ─────────────────────────────────────────────────

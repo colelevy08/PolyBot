@@ -53,36 +53,62 @@ class _TokenBucket:
 
 
 def _parse_trade(raw: dict, address: str) -> TradeRecord | None:
-    """Map a raw CLOB/data-API trade dict to a TradeRecord. Returns None on bad data."""
-    try:
-        # Polymarket CLOB trade fields (adjust if API differs)
-        outcome_map = {
-            "1": "WIN",    # winning side resolved
-            "0": "LOSS",
-            "true": "WIN",
-            "false": "LOSS",
-        }
-        size = float(raw.get("size", raw.get("amount", 0)))
-        price = float(raw.get("price", 0))
-        outcome_raw = str(raw.get("outcome", "")).lower()
-        outcome = outcome_map.get(outcome_raw, "UNRESOLVED")
+    """
+    Map a raw /data/trades response object to a TradeRecord.
 
-        # P&L calculation: for a BUY at price p, if WIN pnl = size*(1-p), LOSS = -size*p
+    Confirmed field names from the CLOB /data/trades endpoint:
+      id, market (condition_id), asset_id (token_id), side, size, price,
+      status, match_time, outcome, maker_address, transaction_hash
+    """
+    try:
+        # outcome field: "YES" / "NO" — resolve relative to the BUY/SELL side
+        size = float(raw.get("size", 0))
+        price = float(raw.get("price", 0))
+        side = (raw.get("side") or "BUY").upper()
+
+        # "outcome" is the token outcome string ("YES"/"NO"), not win/loss.
+        # A BUY YES that resolves YES = WIN; BUY YES that resolves NO = LOSS.
+        # A SELL YES that resolves NO = WIN (bet against); etc.
+        outcome_token = str(raw.get("outcome", "")).upper()  # "YES" or "NO"
+        trade_status = str(raw.get("status", "")).upper()    # CONFIRMED, MATCHED, etc.
+
+        outcome: str
         pnl: float | None = None
-        side = (raw.get("side") or raw.get("type") or "BUY").upper()
-        if outcome == "WIN":
-            pnl = size * (1.0 - price) if side == "BUY" else size * price
-        elif outcome == "LOSS":
-            pnl = -size * price if side == "BUY" else -size * (1.0 - price)
+        if trade_status not in ("CONFIRMED", "MATCHED", "MINED"):
+            # Not yet settled — skip unresolved trades
+            outcome = "UNRESOLVED"
+        elif outcome_token == "YES":
+            if side == "BUY":
+                outcome = "WIN"
+                pnl = size * (1.0 - price)
+            else:
+                outcome = "LOSS"
+                pnl = -size * price
+        elif outcome_token == "NO":
+            if side == "SELL":
+                outcome = "WIN"
+                pnl = size * price
+            else:
+                outcome = "LOSS"
+                pnl = -size * (1.0 - price)
+        else:
+            outcome = "UNRESOLVED"
+
+        # match_time is a Unix second string
+        ts_raw = raw.get("match_time") or raw.get("timestamp") or 0
+        try:
+            ts = int(float(ts_raw)) * 1000  # normalise to milliseconds
+        except (TypeError, ValueError):
+            ts = 0
 
         return TradeRecord(
-            trade_id=str(raw.get("id", raw.get("tradeId", ""))),
-            market_id=str(raw.get("market", raw.get("conditionId", ""))),
-            token_id=str(raw.get("asset_id", raw.get("tokenId", ""))),
+            trade_id=str(raw.get("id", "")),
+            market_id=str(raw.get("market", "")),
+            token_id=str(raw.get("asset_id", "")),
             side=side,
             price=price,
             size=size,
-            timestamp=int(raw.get("timestamp", raw.get("createdAt", 0))),
+            timestamp=ts,
             outcome=outcome,
             pnl=pnl,
             market_category=str(raw.get("category", "unknown")).lower(),
@@ -164,10 +190,12 @@ class WhaleFetcher:
         while len(addresses) < limit:
             fetch_n = min(page_size, limit - len(addresses))
             try:
+                # Confirmed endpoint: GET /v1/leaderboard on data-api.polymarket.com
+                # Params: timePeriod (not "window"), limit, offset
                 data = await self._get_json(
-                    f"{cfg.leaderboard_url}/rankings",
+                    f"{cfg.leaderboard_url}/v1/leaderboard",
                     params={
-                        "window": "all",
+                        "timePeriod": "all",
                         "limit": fetch_n,
                         "offset": offset,
                     },
@@ -176,18 +204,24 @@ class WhaleFetcher:
                 logger.warning("Leaderboard fetch failed at offset %d, stopping.", offset)
                 break
 
-            # Normalise: leaderboard may return {"rankings": [...]} or a list
+            # Response is a plain list of objects (not wrapped in a key)
+            # Address field is "proxyWallet" (confirmed from live API response)
             rows: list[dict] = []
             if isinstance(data, list):
                 rows = data
             elif isinstance(data, dict):
-                rows = data.get("rankings", data.get("data", data.get("results", [])))
+                rows = data.get("data", data.get("results", data.get("rankings", [])))
 
             if not rows:
                 break
 
             for row in rows:
-                addr = row.get("proxy_wallet_address") or row.get("address") or row.get("user")
+                # Primary field confirmed from live API: "proxyWallet"
+                addr = (
+                    row.get("proxyWallet")
+                    or row.get("proxy_wallet_address")
+                    or row.get("address")
+                )
                 if addr and addr not in seen:
                     addresses.append(addr)
                     seen.add(addr)
@@ -210,17 +244,18 @@ class WhaleFetcher:
         async with sem:
             profile = WalletProfile(address=address)
             page_size = 500
-            offset = 0
+            # /data/trades uses cursor-based pagination (not offset).
+            # Initial cursor is "MA==" (base64 of "0"); empty string also works.
+            cursor = "MA=="
 
             while True:
                 try:
-                    # Primary: CLOB trades endpoint
                     data = await self._get_json(
-                        f"{cfg.clob_url}/trades",
+                        f"{cfg.clob_url}/data/trades",
                         params={
                             "maker_address": address,
                             "limit": page_size,
-                            "offset": offset,
+                            "next_cursor": cursor,
                         },
                     )
                 except Exception as exc:
@@ -228,10 +263,12 @@ class WhaleFetcher:
                     break
 
                 trades_raw: list[dict] = []
+                next_cursor: str | None = None
                 if isinstance(data, list):
                     trades_raw = data
                 elif isinstance(data, dict):
-                    trades_raw = data.get("trades", data.get("data", []))
+                    trades_raw = data.get("data", data.get("trades", []))
+                    next_cursor = data.get("next_cursor")
 
                 if not trades_raw:
                     break
@@ -241,9 +278,10 @@ class WhaleFetcher:
                     if t:
                         profile.trades.append(t)
 
-                offset += len(trades_raw)
-                if len(trades_raw) < page_size:
-                    break   # last page
+                # Advance cursor; stop when API signals last page
+                if not next_cursor or next_cursor == cursor or len(trades_raw) < page_size:
+                    break
+                cursor = next_cursor
 
             if profile.trades:
                 profile.total_volume_usdc = sum(t.size for t in profile.trades)
@@ -296,6 +334,45 @@ class WhaleFetcher:
             params={"token_id": token_id},
         )
         return data if isinstance(data, dict) else {}
+
+    async def get_recent_trades(self, maker_address: str, after_ts_sec: int) -> list[dict]:
+        """
+        Fetch trades placed by `maker_address` after `after_ts_sec` (Unix seconds).
+        Used by WhalePollWatcher to detect new whale trades in near-real-time.
+        Returns a list of raw trade dicts from /data/trades.
+        """
+        try:
+            data = await self._get_json(
+                f"{cfg.clob_url}/data/trades",
+                params={
+                    "maker_address": maker_address,
+                    "after": after_ts_sec,
+                    "limit": 50,
+                },
+            )
+        except Exception as exc:
+            logger.debug("get_recent_trades failed for %s: %s", maker_address, exc)
+            return []
+
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict):
+            return data.get("data", data.get("trades", []))
+        return []
+
+    async def get_clob_market(self, condition_id: str) -> dict | None:
+        """
+        Fetch a single CLOB market by condition_id.
+        Returns the market dict (includes tokens[].winner for resolution) or None.
+        """
+        try:
+            data = await self._get_json(
+                f"{cfg.clob_url}/markets/{condition_id}",
+            )
+            return data if isinstance(data, dict) else None
+        except Exception as exc:
+            logger.debug("get_clob_market failed for %s: %s", condition_id, exc)
+            return None
 
     async def get_market_price(self, token_id: str) -> float | None:
         """

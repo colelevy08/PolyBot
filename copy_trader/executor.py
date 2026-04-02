@@ -314,16 +314,21 @@ class TradeExecutor:
                     self._clob_executor,
                     lambda: self._clob_client.get_order(order_id),
                 )
-                status = str(order_data.get("status", "")).upper() if isinstance(order_data, dict) else ""
+                # CLOB order status values are lowercase (confirmed from API docs):
+                #   "live"      → resting on book, keep polling
+                #   "matched"   → filled
+                #   "delayed"   → sports market 3-second delay, keep polling
+                #   "unmatched" → order placed but not matched
+                status = str(order_data.get("status", "")).lower() if isinstance(order_data, dict) else ""
 
-                if status in ("MATCHED", "FILLED"):
+                if status == "matched":
                     logger.info("Fill confirmed  order_id=%s  token=%s", order_id, token_id)
                     return
 
-                if status in ("CANCELLED", "EXPIRED"):
+                if status == "unmatched":
                     logger.warning(
-                        "Order %s for token %s is %s — unblocking position slot.",
-                        order_id, token_id, status,
+                        "Order %s for token %s is unmatched — unblocking position slot.",
+                        order_id, token_id,
                     )
                     self._order_manager.close_order(token_id, exit_price=None, resolved_yes=None)
                     return

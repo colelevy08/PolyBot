@@ -26,9 +26,18 @@ class Settings(BaseSettings):
     # ── API endpoints (no trailing slash) ────────────────────────────────────
     clob_url: str = "https://clob.polymarket.com"
     gamma_url: str = "https://gamma-api.polymarket.com"
+    # data-api hosts the leaderboard and supplementary trade data
     data_url: str = "https://data-api.polymarket.com"
-    leaderboard_url: str = "https://leaderboard-api.polymarket.com"
-    ws_url: str = "wss://ws-subscriptions-clob.polymarket.com/ws/"
+    # leaderboard-api.polymarket.com refuses connections; data-api hosts the leaderboard
+    leaderboard_url: str = "https://data-api.polymarket.com"
+
+    # ── Whale polling ─────────────────────────────────────────────────────────
+    # Polymarket's WebSocket user channel is authenticated and only surfaces
+    # the OWNER's own trades — you cannot subscribe to arbitrary wallet addresses.
+    # The only reliable way to detect other wallets' trades in near-real-time is
+    # to poll /data/trades?maker_address=<whale>&after=<ts>.
+    # With 15 whales and a 2s interval this sends ~7.5 req/s — within rate limits.
+    whale_poll_interval_sec: float = Field(default=2.0, env="WHALE_POLL_INTERVAL_SEC")
 
     # ── Trading params ────────────────────────────────────────────────────────
     bankroll_usdc: float = Field(default=1000.0, env="BANKROLL_USDC")

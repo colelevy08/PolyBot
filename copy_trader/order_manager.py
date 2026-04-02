@@ -212,6 +212,10 @@ class OrderManager:
         wins = sum(1 for o in self._closed if o.pnl_usdc > 0)
         return wins / len(self._closed)
 
+    def open_positions_map(self) -> dict[str, str]:
+        """Return {token_id: market_id (condition_id)} for all open positions."""
+        return {token_id: o.market_id for token_id, o in self._open.items()}
+
     def summary(self) -> dict:
         return {
             "open_positions": self.open_count,

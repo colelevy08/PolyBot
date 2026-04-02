@@ -1,31 +1,23 @@
 """
-WhaleWatcher — subscribes to Polymarket CLOB WebSocket channels for each
-tracked whale address and emits WhaleSignal objects to a callback as fast
-as possible.
+WhalePollWatcher — detects new trades from tracked whale wallets by polling
+the Polymarket CLOB REST API (/data/trades?maker_address=<addr>&after=<ts>).
 
-Speed principles:
-- Single persistent WebSocket connection (not one per whale).
-- orjson for all parsing — raw bytes in, parsed dict out.
-- Callback is called directly in the receive loop with zero queuing overhead
-  for the critical path (the executor is expected to be fast enough).
-- Reconnect with exponential back-off; subscriptions re-sent immediately.
-- No logging on the hot path (inside the tight receive loop).
+WHY polling instead of WebSocket:
+  Polymarket's WebSocket user channel (wss://...polymarket.com/ws/user) is
+  authenticated and only delivers trades for the AUTHENTICATED user (i.e.,
+  your own account). There is no mechanism to subscribe to arbitrary wallet
+  addresses via WebSocket. The market channel delivers order-book and price
+  events but does NOT include the trader's wallet address in the event payload,
+  making it impossible to reliably attribute trades to tracked wallets.
 
-WebSocket protocol (Polymarket CLOB):
-  Connect: wss://ws-subscriptions-clob.polymarket.com/ws/
-  Subscribe user channel:
-    {"type": "subscribe", "channel": "user", "userAddress": "<address>"}
-  Trade event shape (subset used here):
-    {
-      "type": "trade",
-      "userAddress": "<address>",
-      "asset_id": "<token_id>",
-      "market": "<market_id>",
-      "side": "BUY" | "SELL",
-      "price": "0.72",
-      "amount": "50.00",
-      "timestamp": 1700000000000
-    }
+  Polling /data/trades with `after=<ts>` per whale is the only confirmed
+  way to detect external wallets' trades in near-real-time.
+
+Performance:
+  - 15 whales × 1 poll per 2s = 7.5 req/s → well within the 10 rps rate limit.
+  - Polls run concurrently via asyncio (a semaphore limits burst concurrency).
+  - Latency to detect a trade: 0–2 seconds (one poll interval).
+  - No blocking: _parse_signal and callback are called inside the async loop.
 """
 from __future__ import annotations
 
@@ -35,34 +27,51 @@ import time
 from collections.abc import Callable, Coroutine
 from typing import Any
 
-import orjson
-import websockets
-
 from config import cfg
+from whale_analyzer.fetcher import WhaleFetcher
 from whale_analyzer.models import WhaleSignal
 
 logger = logging.getLogger(__name__)
 
-# Type alias: async callback that receives a WhaleSignal
 SignalCallback = Callable[[WhaleSignal], Coroutine[Any, Any, None]]
 
+# Max simultaneous in-flight poll requests (burst protection)
+_POLL_CONCURRENCY = 8
 
-def _parse_signal(raw: dict) -> WhaleSignal | None:
+
+def _parse_signal(raw: dict, whale_address: str) -> WhaleSignal | None:
     """
-    Parse a raw WebSocket event dict into a WhaleSignal.
-    Returns None if the event is not a trade or is malformed.
-    Hot path — keep allocations minimal.
+    Parse a raw /data/trades response dict into a WhaleSignal.
+    Returns None if the trade is not a BUY or is missing required fields.
+
+    Confirmed /data/trades field names:
+      id, market (condition_id), asset_id (token_id), side, size, price,
+      status, match_time (unix second string), outcome, maker_address
     """
-    if raw.get("type") != "trade":
-        return None
     try:
+        side = (raw.get("side") or "").upper()
+        token_id = str(raw.get("asset_id", ""))
+        market_id = str(raw.get("market", ""))
+        price_str = raw.get("price")
+        size_str = raw.get("size")
+
+        if not token_id or not market_id or price_str is None or size_str is None:
+            return None
+
+        # match_time is a Unix second string (e.g. "1672290701")
+        ts_raw = raw.get("match_time") or raw.get("timestamp") or 0
+        try:
+            trade_ts_sec = int(float(ts_raw))
+        except (TypeError, ValueError):
+            trade_ts_sec = 0
+
         return WhaleSignal(
-            whale_address=raw["userAddress"],
-            market_id=raw.get("market", raw.get("conditionId", "")),
-            token_id=raw.get("asset_id", raw.get("tokenId", "")),
-            side=(raw.get("side") or "BUY").upper(),
-            price=float(raw["price"]),
-            size_usdc=float(raw.get("amount", raw.get("size", 0))),
+            whale_address=whale_address,
+            market_id=market_id,
+            token_id=token_id,
+            side=side,
+            price=float(price_str),
+            size_usdc=float(size_str),
             detected_ts=int(time.time() * 1000),  # our clock, not server's
             raw_event=raw,
         )
@@ -72,12 +81,12 @@ def _parse_signal(raw: dict) -> WhaleSignal | None:
 
 class WhaleWatcher:
     """
-    Subscribes to a list of whale addresses on Polymarket's CLOB WebSocket
-    and fires `on_signal` for every trade event.
+    Polls /data/trades for each tracked whale address and emits WhaleSignal
+    objects to a callback for every new trade detected.
 
     Usage:
         watcher = WhaleWatcher(whale_addresses, on_signal=executor.handle_signal)
-        await watcher.run()
+        await watcher.run()   # runs until cancelled
     """
 
     def __init__(
@@ -87,76 +96,78 @@ class WhaleWatcher:
     ) -> None:
         self._addresses = whale_addresses
         self._on_signal = on_signal
-        self._running = False
+        # Per-whale cursor: last seen trade timestamp in Unix seconds.
+        # Initialised to "now" so we only pick up new trades after startup.
+        now_sec = int(time.time())
+        self._last_ts: dict[str, int] = {addr: now_sec for addr in whale_addresses}
+        self._sem = asyncio.Semaphore(_POLL_CONCURRENCY)
+        self._fetcher: WhaleFetcher | None = None
+
+    def attach_fetcher(self, fetcher: WhaleFetcher) -> None:
+        """Inject the shared WhaleFetcher (provides aiohttp session)."""
+        self._fetcher = fetcher
 
     async def run(self) -> None:
-        """Main loop — connects and reconnects indefinitely."""
-        self._running = True
-        delay = cfg.ws_reconnect_delay
+        """Main poll loop — runs until cancelled."""
+        if self._fetcher is None:
+            raise RuntimeError("Call attach_fetcher() before run()")
 
-        while self._running:
-            try:
-                await self._connect_and_listen()
-                delay = cfg.ws_reconnect_delay  # reset on clean exit
-            except Exception as exc:
-                logger.warning(
-                    "WebSocket disconnected (%s). Reconnecting in %.1fs...",
-                    exc, delay,
-                )
-                await asyncio.sleep(delay)
-                delay = min(delay * 2, 30.0)  # exponential back-off, cap 30s
-
-    async def stop(self) -> None:
-        self._running = False
-
-    async def _connect_and_listen(self) -> None:
         logger.info(
-            "Connecting to Polymarket WebSocket: %s  (%d whales)",
-            cfg.ws_url, len(self._addresses),
+            "WhalePollWatcher started — tracking %d whales (poll=%.1fs)",
+            len(self._addresses), cfg.whale_poll_interval_sec,
         )
-        async with websockets.connect(
-            cfg.ws_url,
-            ping_interval=cfg.ws_ping_interval,
-            ping_timeout=cfg.ws_ping_timeout,
-            # Large read buffer to handle bursts without stalling
-            max_size=2**20,
-            # Disable compression — latency over bandwidth
-            compression=None,
-        ) as ws:
-            # Subscribe to all whale addresses immediately
-            await self._subscribe_all(ws)
-            logger.info("Subscribed. Listening for whale trades...")
+        try:
+            while True:
+                poll_start = time.monotonic()
+                await self._poll_all()
+                # Sleep for whatever remains of the interval (avoid drift)
+                elapsed = time.monotonic() - poll_start
+                sleep_for = max(0.0, cfg.whale_poll_interval_sec - elapsed)
+                await asyncio.sleep(sleep_for)
+        except asyncio.CancelledError:
+            pass
 
-            async for raw_bytes in ws:
-                # ── CRITICAL PATH: parse and fire as fast as possible ─────────
-                try:
-                    event = orjson.loads(raw_bytes)
-                except Exception:
-                    continue  # malformed JSON — skip
+    async def _poll_all(self) -> None:
+        """Fire concurrent polls for all tracked whales."""
+        tasks = [
+            asyncio.create_task(self._poll_whale(addr))
+            for addr in self._addresses
+        ]
+        # gather with return_exceptions so one failure doesn't kill the loop
+        await asyncio.gather(*tasks, return_exceptions=True)
 
-                # Handle both single events and batched arrays
-                if isinstance(event, list):
-                    for item in event:
-                        await self._dispatch(item)
-                elif isinstance(event, dict):
-                    await self._dispatch(event)
+    async def _poll_whale(self, address: str) -> None:
+        """Fetch new trades for a single whale and dispatch any signals found."""
+        assert self._fetcher is not None
+        async with self._sem:
+            after_ts = self._last_ts.get(address, 0)
+            raw_trades = await self._fetcher.get_recent_trades(address, after_ts)
 
-    async def _subscribe_all(self, ws: Any) -> None:
-        """Send subscription messages for all tracked whale addresses."""
-        for address in self._addresses:
-            # Decode to str so websockets sends a text frame (not binary).
-            # Polymarket's WS server expects text-framed JSON; binary frames
-            # are silently ignored or cause a protocol error.
-            msg = orjson.dumps({
-                "type": "subscribe",
-                "channel": "user",
-                "userAddress": address,
-            }).decode()
-            await ws.send(msg)
-        logger.debug("Sent %d subscription messages.", len(self._addresses))
+        if not raw_trades:
+            return
 
-    async def _dispatch(self, event: dict) -> None:
-        signal = _parse_signal(event)
-        if signal is not None:
-            # Fire the callback — executor decides whether to trade
-            await self._on_signal(signal)
+        # Sort ascending by match_time so we process oldest first and advance
+        # the cursor correctly even when multiple trades arrive in one poll.
+        def _ts(t: dict) -> int:
+            try:
+                return int(float(t.get("match_time") or t.get("timestamp") or 0))
+            except (TypeError, ValueError):
+                return 0
+
+        raw_trades.sort(key=_ts)
+
+        latest_ts = self._last_ts.get(address, 0)
+        for raw in raw_trades:
+            trade_ts = _ts(raw)
+            if trade_ts <= after_ts:
+                continue  # already seen (timestamp not strictly advancing)
+
+            signal = _parse_signal(raw, address)
+            if signal is not None:
+                await self._on_signal(signal)
+
+            if trade_ts > latest_ts:
+                latest_ts = trade_ts
+
+        # Advance cursor past the last trade we processed
+        self._last_ts[address] = latest_ts
