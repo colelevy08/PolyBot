@@ -60,7 +60,7 @@ class WalletProfile:
 
     @property
     def total_pnl(self) -> float:
-        return sum(t.pnl for t in self.trades if t.pnl is not None)
+        return sum((t.pnl for t in self.trades if t.pnl is not None), 0.0)
 
 
 @dataclass

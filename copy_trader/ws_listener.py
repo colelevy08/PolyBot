@@ -144,11 +144,14 @@ class WhaleWatcher:
     async def _subscribe_all(self, ws: Any) -> None:
         """Send subscription messages for all tracked whale addresses."""
         for address in self._addresses:
+            # Decode to str so websockets sends a text frame (not binary).
+            # Polymarket's WS server expects text-framed JSON; binary frames
+            # are silently ignored or cause a protocol error.
             msg = orjson.dumps({
                 "type": "subscribe",
                 "channel": "user",
                 "userAddress": address,
-            })
+            }).decode()
             await ws.send(msg)
         logger.debug("Sent %d subscription messages.", len(self._addresses))
 

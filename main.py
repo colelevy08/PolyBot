@@ -20,7 +20,6 @@ import asyncio
 import logging
 import signal
 import sys
-import time
 
 try:
     import uvloop
@@ -51,17 +50,20 @@ logger = logging.getLogger(__name__)
 
 
 async def _stats_loop(order_manager: OrderManager, interval: float = 60.0) -> None:
-    """Logs position summary every `interval` seconds."""
-    while True:
-        await asyncio.sleep(interval)
-        summary = order_manager.summary()
-        logger.info(
-            "[STATS] open=%d closed=%d pnl=$%.2f win_rate=%.1f%%",
-            summary["open_positions"],
-            summary["closed_positions"],
-            summary["total_pnl_usdc"],
-            summary["win_rate"] * 100,
-        )
+    """Logs position summary every `interval` seconds. Exits cleanly on cancel."""
+    try:
+        while True:
+            await asyncio.sleep(interval)
+            summary = order_manager.summary()
+            logger.info(
+                "[STATS] open=%d closed=%d pnl=$%.2f win_rate=%.1f%%",
+                summary["open_positions"],
+                summary["closed_positions"],
+                summary["total_pnl_usdc"],
+                summary["win_rate"] * 100,
+            )
+    except asyncio.CancelledError:
+        pass
 
 
 async def _main() -> None:
@@ -95,20 +97,32 @@ async def _main() -> None:
 
         # ── Graceful shutdown ─────────────────────────────────────────────────
         loop = asyncio.get_running_loop()
+        main_task: asyncio.Task | None = None
 
         def _shutdown() -> None:
             console.print("\n[yellow]Shutdown signal received.[/]")
-            asyncio.create_task(watcher.stop())
+            if main_task is not None:
+                # Cancelling the gather task propagates CancelledError to both
+                # watcher.run() and _stats_loop(), unwinding them cleanly so
+                # WhaleFetcher.__aexit__ can close the HTTP session.
+                main_task.cancel()
 
         for sig in (signal.SIGINT, signal.SIGTERM):
             loop.add_signal_handler(sig, _shutdown)
 
         # ── Run ───────────────────────────────────────────────────────────────
         console.rule("[bold green]Bot is LIVE — listening for whale trades")
-        await asyncio.gather(
-            watcher.run(),
-            _stats_loop(order_manager),
+        main_task = asyncio.ensure_future(
+            asyncio.gather(
+                watcher.run(),
+                _stats_loop(order_manager),
+                return_exceptions=True,
+            )
         )
+        try:
+            await main_task
+        except asyncio.CancelledError:
+            pass
 
 
 if __name__ == "__main__":

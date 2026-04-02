@@ -45,7 +45,13 @@ def _safe_div(a: float, b: float, default: float = 0.0) -> float:
 def _compute_profit_factor(trades: list[TradeRecord]) -> float:
     gross_profit = sum(t.pnl for t in trades if t.pnl is not None and t.pnl > 0)
     gross_loss = abs(sum(t.pnl for t in trades if t.pnl is not None and t.pnl < 0))
-    return _safe_div(gross_profit, gross_loss, default=0.0)
+    if gross_loss == 0:
+        # No losing trades: profit factor is effectively infinite. Return a large
+        # sentinel (100.0) so min-max normalisation maps these wallets to 1.0,
+        # above all wallets that have at least one loss. Returning 0.0 here would
+        # incorrectly rank perfect wallets last.
+        return 100.0 if gross_profit > 0 else 0.0
+    return gross_profit / gross_loss
 
 
 def _compute_sharpe(pnls: np.ndarray) -> float:
@@ -183,13 +189,12 @@ class WalletScorer:
                 + _WEIGHTS["avg_edge"]      * norm["avg_edge"][i]
                 + _WEIGHTS["trade_count_log"] * norm["trade_count_log"][i]
             )
-            # Use object.__setattr__ since WalletScore uses __slots__
-            object.__setattr__(score, "composite_score", composite)
+            score.composite_score = composite
 
         # Sort by composite score descending and assign ranks
         raw_scores.sort(key=lambda s: s.composite_score, reverse=True)
         for rank, score in enumerate(raw_scores, start=1):
-            object.__setattr__(score, "rank", rank)
+            score.rank = rank
 
         logger.info(
             "Scoring complete. Top wallet: %s (score=%.4f, win_rate=%.2f%%, PnL=%.2f)",
