@@ -26,6 +26,32 @@ logger = logging.getLogger(__name__)
 _CONCURRENCY = 25
 
 
+class _TokenBucket:
+    """
+    Simple async token-bucket rate limiter.
+    Limits to `rate` requests per second across all callers.
+    """
+
+    def __init__(self, rate: float) -> None:
+        self._rate = rate          # tokens added per second
+        self._tokens = rate        # start full
+        self._last_refill = time.monotonic()
+        self._lock = asyncio.Lock()
+
+    async def acquire(self) -> None:
+        async with self._lock:
+            now = time.monotonic()
+            elapsed = now - self._last_refill
+            self._tokens = min(self._rate, self._tokens + elapsed * self._rate)
+            self._last_refill = now
+            if self._tokens < 1.0:
+                wait = (1.0 - self._tokens) / self._rate
+                await asyncio.sleep(wait)
+                self._tokens = 0.0
+            else:
+                self._tokens -= 1.0
+
+
 def _parse_trade(raw: dict, address: str) -> TradeRecord | None:
     """Map a raw CLOB/data-API trade dict to a TradeRecord. Returns None on bad data."""
     try:
@@ -78,6 +104,7 @@ class WhaleFetcher:
 
     def __init__(self) -> None:
         self._session: aiohttp.ClientSession | None = None
+        self._rate_limiter = _TokenBucket(cfg.rate_limit_rps)
 
     async def __aenter__(self) -> "WhaleFetcher":
         connector = aiohttp.TCPConnector(
@@ -104,8 +131,9 @@ class WhaleFetcher:
     # ── Internal helpers ──────────────────────────────────────────────────────
 
     async def _get_json(self, url: str, params: dict | None = None) -> Any:
-        """GET with retry, returns parsed JSON using orjson."""
+        """GET with retry and rate limiting, returns parsed JSON using orjson."""
         assert self._session is not None, "Use as async context manager"
+        await self._rate_limiter.acquire()
         for attempt in range(cfg.max_retries):
             try:
                 async with self._session.get(url, params=params) as resp:

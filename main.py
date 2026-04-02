@@ -18,8 +18,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import signal
 import sys
+import time
 
 try:
     import uvloop
@@ -37,6 +39,7 @@ from whale_analyzer.reducer import WhaleReducer
 from copy_trader.ws_listener import WhaleWatcher
 from copy_trader.executor import TradeExecutor
 from copy_trader.order_manager import OrderManager
+from copy_trader.position_monitor import PositionMonitor
 
 console = Console()
 
@@ -47,6 +50,15 @@ logging.basicConfig(
     handlers=[RichHandler(console=console, rich_tracebacks=True)],
 )
 logger = logging.getLogger(__name__)
+
+
+def _whale_data_is_stale() -> bool:
+    """Return True if whales.json is missing or older than cfg.whale_data_max_age_hours."""
+    path = cfg.whale_data_path
+    if not os.path.exists(path):
+        return True
+    age_hours = (time.time() - os.path.getmtime(path)) / 3600.0
+    return age_hours > cfg.whale_data_max_age_hours
 
 
 async def _stats_loop(
@@ -78,7 +90,19 @@ async def _stats_loop(
 async def _main() -> None:
     console.rule("[bold blue]PolyBot — Copy Trading Engine")
 
-    # ── Load whale addresses ──────────────────────────────────────────────────
+    # ── Load whale addresses (re-analyse if stale) ────────────────────────────
+    order_manager = OrderManager()
+    order_manager.load()  # restore positions from previous run
+
+    async with WhaleFetcher() as _prefetch:
+        if _whale_data_is_stale():
+            console.print(
+                f"[yellow]Whale data missing or older than "
+                f"{cfg.whale_data_max_age_hours:.0f}h — running analysis...[/]"
+            )
+            reducer = WhaleReducer()
+            await reducer.run(_prefetch)
+
     try:
         whale_addresses = WhaleReducer.load_whale_addresses()
     except FileNotFoundError as exc:
@@ -86,9 +110,6 @@ async def _main() -> None:
         sys.exit(1)
 
     console.print(f"[green]Tracking {len(whale_addresses)} whale wallets.[/]")
-
-    # ── Initialise components ─────────────────────────────────────────────────
-    order_manager = OrderManager()
 
     async with WhaleFetcher() as fetcher:
         executor = TradeExecutor(
@@ -107,6 +128,7 @@ async def _main() -> None:
             whale_addresses=whale_addresses,
             on_signal=executor.handle_signal,
         )
+        position_monitor = PositionMonitor(fetcher=fetcher, order_manager=order_manager)
 
         # ── Graceful shutdown ─────────────────────────────────────────────────
         loop = asyncio.get_running_loop()
@@ -115,9 +137,6 @@ async def _main() -> None:
         def _shutdown() -> None:
             console.print("\n[yellow]Shutdown signal received.[/]")
             if main_task is not None:
-                # Cancelling the gather task propagates CancelledError to both
-                # watcher.run() and _stats_loop(), unwinding them cleanly so
-                # WhaleFetcher.__aexit__ can close the HTTP session.
                 main_task.cancel()
 
         for sig in (signal.SIGINT, signal.SIGTERM):
@@ -129,6 +148,7 @@ async def _main() -> None:
             asyncio.gather(
                 watcher.run(),
                 _stats_loop(order_manager, executor),
+                position_monitor.run(),
                 return_exceptions=True,
             )
         )
@@ -136,6 +156,10 @@ async def _main() -> None:
             await main_task
         except asyncio.CancelledError:
             pass
+        finally:
+            # Persist order state before exit so positions survive restart
+            order_manager.save()
+            console.print("[green]Order state saved.[/]")
 
 
 if __name__ == "__main__":

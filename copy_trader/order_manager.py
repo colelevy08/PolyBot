@@ -12,9 +12,12 @@ but never awaited.
 from __future__ import annotations
 
 import logging
+import os
 import time
 from dataclasses import dataclass, field
 from typing import Optional
+
+import orjson
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +55,9 @@ class ClosedOrder:
     pnl_usdc: float
     placed_ts: int
     closed_ts: int
+
+
+_STATE_PATH = "data/order_manager_state.json"
 
 
 class OrderManager:
@@ -140,6 +146,54 @@ class OrderManager:
             token_id, pnl, order.side, order.price,
             f"{ep:.3f}" if ep is not None else "N/A",
         )
+
+    # ── Persistence ──────────────────────────────────────────────────────────
+
+    def save(self, path: str = _STATE_PATH) -> None:
+        """Persist open and closed orders to disk as JSON."""
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        state = {
+            "open": [
+                {
+                    "order_id": o.order_id, "token_id": o.token_id,
+                    "market_id": o.market_id, "side": o.side,
+                    "price": o.price, "size_usdc": o.size_usdc,
+                    "whale_address": o.whale_address, "placed_ts": o.placed_ts,
+                }
+                for o in self._open.values()
+            ],
+            "closed": [
+                {
+                    "order_id": c.order_id, "token_id": c.token_id,
+                    "market_id": c.market_id, "side": c.side,
+                    "entry_price": c.entry_price, "exit_price": c.exit_price,
+                    "size_usdc": c.size_usdc, "pnl_usdc": c.pnl_usdc,
+                    "placed_ts": c.placed_ts, "closed_ts": c.closed_ts,
+                }
+                for c in self._closed
+            ],
+        }
+        with open(path, "wb") as f:
+            f.write(orjson.dumps(state, option=orjson.OPT_INDENT_2))
+        logger.debug("OrderManager state saved (%d open, %d closed)", len(self._open), len(self._closed))
+
+    def load(self, path: str = _STATE_PATH) -> None:
+        """Restore state from disk. No-op if file does not exist."""
+        if not os.path.exists(path):
+            return
+        try:
+            with open(path, "rb") as f:
+                state = orjson.loads(f.read())
+            for o in state.get("open", []):
+                self._open[o["token_id"]] = OpenOrder(**o)
+            for c in state.get("closed", []):
+                self._closed.append(ClosedOrder(**c))
+            logger.info(
+                "OrderManager state loaded: %d open, %d closed positions.",
+                len(self._open), len(self._closed),
+            )
+        except Exception as exc:
+            logger.warning("Failed to load OrderManager state from %s: %s", path, exc)
 
     # ── Stats ─────────────────────────────────────────────────────────────────
 

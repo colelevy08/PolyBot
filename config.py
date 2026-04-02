@@ -65,6 +65,20 @@ class Settings(BaseSettings):
     ws_ping_timeout: float = 10.0
     ws_reconnect_delay: float = 0.5  # initial back-off (doubles on failure)
 
+    # ── Rate limiting ─────────────────────────────────────────────────────────
+    # Max requests per second to Polymarket APIs during whale analysis
+    rate_limit_rps: float = Field(default=10.0, env="RATE_LIMIT_RPS")
+
+    # ── Position monitoring ───────────────────────────────────────────────────
+    # How often to poll open positions for market resolution (seconds)
+    position_poll_interval_sec: float = Field(default=300.0, env="POSITION_POLL_INTERVAL_SEC")
+    # How long to wait for an order to fill before cancelling (seconds)
+    order_fill_timeout_sec: float = Field(default=30.0, env="ORDER_FILL_TIMEOUT_SEC")
+
+    # ── Whale data freshness ──────────────────────────────────────────────────
+    # Trigger re-analysis if whales.json is older than this many hours
+    whale_data_max_age_hours: float = Field(default=24.0, env="WHALE_DATA_MAX_AGE_HOURS")
+
     # ── Misc ──────────────────────────────────────────────────────────────────
     log_level: str = Field(default="INFO", env="LOG_LEVEL")
     chain_id: int = 137  # Polygon

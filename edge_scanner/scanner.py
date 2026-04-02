@@ -105,6 +105,11 @@ class EdgeScanner:
         asks: list[dict] = book.get("asks", [])
 
         # ── Best prices ───────────────────────────────────────────────────────
+        # Sort to guarantee correct best price regardless of API response order.
+        # Bids: highest price first (best bid = most willing buyer).
+        # Asks: lowest price first (best ask = cheapest seller).
+        bids = sorted(bids, key=lambda x: float(x["price"]), reverse=True)
+        asks = sorted(asks, key=lambda x: float(x["price"]))
         best_ask = float(asks[0]["price"]) if asks else None
         best_bid = float(bids[0]["price"]) if bids else None
 

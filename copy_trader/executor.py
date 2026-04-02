@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import aiohttp
 import orjson
@@ -63,6 +64,10 @@ class TradeExecutor:
         # Pre-instantiate ClobClient once (not per-order) to reuse its session.
         # Falls back to None if py_clob_client is not installed.
         self._clob_client = None
+        # Dedicated single-threaded executor for ALL ClobClient calls.
+        # ClobClient (requests-based) is NOT thread-safe; serialising via
+        # max_workers=1 prevents concurrent calls from corrupting its state.
+        self._clob_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="clob")
         if cfg.poly_api_key:
             try:
                 from py_clob_client.client import ClobClient
@@ -96,7 +101,7 @@ class TradeExecutor:
 
         try:
             loop = asyncio.get_running_loop()
-            raw = await loop.run_in_executor(None, self._clob_client.get_balance)
+            raw = await loop.run_in_executor(self._clob_executor, self._clob_client.get_balance)
 
             # get_balance() returns a string like "150.23" or a dict;
             # normalise to float
@@ -149,6 +154,11 @@ class TradeExecutor:
             logger.debug("Dedup skip: %s (last signal %dms ago)", token_id, now_ms - last_ms)
             return
         self._last_signal[token_id] = now_ms
+
+        # ── Prune stale dedup entries (prevent unbounded dict growth) ─────────
+        if len(self._last_signal) > 5_000:
+            cutoff = now_ms - 60_000  # drop entries older than 60s
+            self._last_signal = {k: v for k, v in self._last_signal.items() if v > cutoff}
 
         # ── Check if we already have a position ───────────────────────────────
         if self._order_manager.has_open_position(token_id):
@@ -207,6 +217,11 @@ class TradeExecutor:
             size, edge.edge, total_latency_ms,
         )
 
+        # ── Confirm fill (async, does not block main signal path) ─────────────
+        asyncio.ensure_future(
+            self._confirm_fill(order_id, signal.token_id)
+        )
+
     async def _submit_clob_order(
         self,
         token_id: str,
@@ -241,11 +256,13 @@ class TradeExecutor:
                 side=side,
             )
             loop = asyncio.get_running_loop()
+            # Use dedicated single-threaded executor — ClobClient is not thread-safe
             signed_order = await loop.run_in_executor(
-                None, self._clob_client.create_order, order_args
+                self._clob_executor, self._clob_client.create_order, order_args
             )
             resp = await loop.run_in_executor(
-                None, self._clob_client.post_order, signed_order, OrderType.GTC
+                self._clob_executor,
+                lambda: self._clob_client.post_order(signed_order, OrderType.GTC),
             )
             return str(resp.get("orderID", resp.get("id", "")))
 
@@ -274,3 +291,57 @@ class TradeExecutor:
             resp.raise_for_status()
             data = orjson.loads(await resp.read())
             return str(data.get("orderID", data.get("id", "")))
+
+    async def _confirm_fill(self, order_id: str, token_id: str) -> None:
+        """
+        Poll the CLOB for fill confirmation after an order is placed.
+        If the order is not matched within cfg.order_fill_timeout_sec, cancel
+        it and unblock the position slot so future signals can re-enter.
+
+        Runs as a fire-and-forget task (does not block signal processing).
+        """
+        if not cfg.poly_api_key or self._clob_client is None or order_id.startswith("test_"):
+            return  # test mode — nothing to confirm
+
+        deadline = time.time() + cfg.order_fill_timeout_sec
+        poll_interval = 2.0  # seconds between status checks
+
+        while time.time() < deadline:
+            await asyncio.sleep(poll_interval)
+            try:
+                loop = asyncio.get_running_loop()
+                order_data = await loop.run_in_executor(
+                    self._clob_executor,
+                    lambda: self._clob_client.get_order(order_id),
+                )
+                status = str(order_data.get("status", "")).upper() if isinstance(order_data, dict) else ""
+
+                if status in ("MATCHED", "FILLED"):
+                    logger.info("Fill confirmed  order_id=%s  token=%s", order_id, token_id)
+                    return
+
+                if status in ("CANCELLED", "EXPIRED"):
+                    logger.warning(
+                        "Order %s for token %s is %s — unblocking position slot.",
+                        order_id, token_id, status,
+                    )
+                    self._order_manager.close_order(token_id, exit_price=None, resolved_yes=None)
+                    return
+
+            except Exception as exc:
+                logger.debug("Fill poll failed for %s: %s", order_id, exc)
+
+        # Timeout — cancel the order and free the slot
+        logger.warning(
+            "Order %s unfilled after %.0fs — cancelling and unblocking %s.",
+            order_id, cfg.order_fill_timeout_sec, token_id,
+        )
+        try:
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(
+                self._clob_executor,
+                lambda: self._clob_client.cancel(order_id),
+            )
+        except Exception as exc:
+            logger.warning("Cancel failed for %s: %s", order_id, exc)
+        self._order_manager.close_order(token_id, exit_price=None, resolved_yes=None)
