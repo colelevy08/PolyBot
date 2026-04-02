@@ -36,6 +36,7 @@ class Settings(BaseSettings):
     max_position_fraction: float = Field(
         default=0.10, env="MAX_POSITION_FRACTION"
     )
+    max_bankroll_usdc: float = Field(default=1000.0, env="MAX_BANKROLL_USDC")
     min_edge_threshold: float = Field(default=0.03, env="MIN_EDGE_THRESHOLD")
     min_prob: float = Field(default=0.05, env="MIN_PROB")
     max_prob: float = Field(default=0.95, env="MAX_PROB")

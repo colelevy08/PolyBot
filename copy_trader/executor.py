@@ -112,10 +112,15 @@ class TradeExecutor:
                 )
                 return self._bankroll
 
+            # Cap at MAX_BANKROLL_USDC — never risk more than this at once
+            capped = min(usdc, cfg.max_bankroll_usdc)
             old = self._bankroll
-            self._bankroll = usdc
-            self._scanner._bankroll = usdc  # keep edge scanner in sync
-            logger.info("Bankroll synced: $%.2f → $%.2f", old, usdc)
+            self._bankroll = capped
+            self._scanner._bankroll = capped  # keep edge scanner in sync
+            logger.info(
+                "Bankroll synced: $%.2f → $%.2f (balance=$%.2f, cap=$%.2f)",
+                old, capped, usdc, cfg.max_bankroll_usdc,
+            )
             return usdc
 
         except Exception as exc:
