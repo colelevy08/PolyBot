@@ -1,6 +1,6 @@
 """
 WhalePollWatcher — detects new trades from tracked whale wallets by polling
-the Polymarket CLOB REST API (/data/trades?maker_address=<addr>&after=<ts>).
+data-api.polymarket.com/trades?user=<addr>.
 
 WHY polling instead of WebSocket:
   Polymarket's WebSocket user channel (wss://...polymarket.com/ws/user) is
@@ -10,8 +10,13 @@ WHY polling instead of WebSocket:
   events but does NOT include the trader's wallet address in the event payload,
   making it impossible to reliably attribute trades to tracked wallets.
 
-  Polling /data/trades with `after=<ts>` per whale is the only confirmed
-  way to detect external wallets' trades in near-real-time.
+  The CLOB /data/trades endpoint requires API authentication and cannot be
+  used to query other wallets unauthenticated.
+
+  Polling data-api.polymarket.com/trades?user=<addr> (public, no auth) is
+  the correct way to detect external wallets' trades in near-real-time.
+  Client-side timestamp filtering is applied since the API does not support
+  server-side filtering by timestamp.
 
 Performance:
   - 15 whales × 1 poll per 2s = 7.5 req/s → well within the 10 rps rate limit.
@@ -41,29 +46,22 @@ _POLL_CONCURRENCY = 8
 
 def _parse_signal(raw: dict, whale_address: str) -> WhaleSignal | None:
     """
-    Parse a raw /data/trades response dict into a WhaleSignal.
-    Returns None if the trade is not a BUY or is missing required fields.
+    Parse a raw data-api.polymarket.com/trades response dict into a WhaleSignal.
+    Returns None if required fields are missing.
 
-    Confirmed /data/trades field names:
-      id, market (condition_id), asset_id (token_id), side, size, price,
-      status, match_time (unix second string), outcome, maker_address
+    Confirmed field names from GET data-api.polymarket.com/trades?user=<addr>:
+      side, asset (token_id), conditionId (market_id), price, size,
+      timestamp (unix integer seconds)
     """
     try:
         side = (raw.get("side") or "").upper()
-        token_id = str(raw.get("asset_id", ""))
-        market_id = str(raw.get("market", ""))
+        token_id = str(raw.get("asset", ""))
+        market_id = str(raw.get("conditionId", ""))
         price_str = raw.get("price")
         size_str = raw.get("size")
 
         if not token_id or not market_id or price_str is None or size_str is None:
             return None
-
-        # match_time is a Unix second string (e.g. "1672290701")
-        ts_raw = raw.get("match_time") or raw.get("timestamp") or 0
-        try:
-            trade_ts_sec = int(float(ts_raw))
-        except (TypeError, ValueError):
-            trade_ts_sec = 0
 
         return WhaleSignal(
             whale_address=whale_address,
@@ -146,11 +144,11 @@ class WhaleWatcher:
         if not raw_trades:
             return
 
-        # Sort ascending by match_time so we process oldest first and advance
+        # Sort ascending by timestamp so we process oldest first and advance
         # the cursor correctly even when multiple trades arrive in one poll.
         def _ts(t: dict) -> int:
             try:
-                return int(float(t.get("match_time") or t.get("timestamp") or 0))
+                return int(float(t.get("timestamp") or 0))
             except (TypeError, ValueError):
                 return 0
 

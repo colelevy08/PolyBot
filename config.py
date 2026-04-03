@@ -69,11 +69,6 @@ class Settings(BaseSettings):
     request_timeout_sec: float = 10.0
     max_retries: int = 3
 
-    # ── WebSocket tuning ──────────────────────────────────────────────────────
-    ws_ping_interval: float = 20.0   # seconds
-    ws_ping_timeout: float = 10.0
-    ws_reconnect_delay: float = 0.5  # initial back-off (doubles on failure)
-
     # ── Rate limiting ─────────────────────────────────────────────────────────
     # Max requests per second to Polymarket APIs during whale analysis
     rate_limit_rps: float = Field(default=10.0, env="RATE_LIMIT_RPS")

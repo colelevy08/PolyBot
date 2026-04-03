@@ -55,30 +55,27 @@ class _TokenBucket:
 
 def _parse_trade(raw: dict, address: str) -> TradeRecord | None:
     """
-    Map a raw /data/trades response object to a TradeRecord.
+    Map a raw data-api.polymarket.com/trades response object to a TradeRecord.
 
-    Confirmed field names from the CLOB /data/trades endpoint:
-      id, market (condition_id), asset_id (token_id), side, size, price,
-      status, match_time, outcome, maker_address, transaction_hash
+    Confirmed field names from GET data-api.polymarket.com/trades?user=<addr>:
+      proxyWallet, side, asset (token_id), conditionId (market_id),
+      size, price, timestamp (unix seconds), outcome ("Yes"/"No")
+
+    The data-api only returns settled trades so no status check is needed.
     """
     try:
-        # outcome field: "YES" / "NO" — resolve relative to the BUY/SELL side
         size = float(raw.get("size", 0))
         price = float(raw.get("price", 0))
         side = (raw.get("side") or "BUY").upper()
 
-        # "outcome" is the token outcome string ("YES"/"NO"), not win/loss.
-        # A BUY YES that resolves YES = WIN; BUY YES that resolves NO = LOSS.
-        # A SELL YES that resolves NO = WIN (bet against); etc.
-        outcome_token = str(raw.get("outcome", "")).upper()  # "YES" or "NO"
-        trade_status = str(raw.get("status", "")).upper()    # CONFIRMED, MATCHED, etc.
+        # outcome is "Yes" or "No" (title-case from data-api).
+        # A BUY at outcome "Yes" that resolves YES = WIN.
+        # A BUY at outcome "No" that resolves NO = LOSS (bet on wrong side).
+        outcome_token = str(raw.get("outcome", "")).upper()  # normalise to "YES"/"NO"
 
         outcome: str
         pnl: float | None = None
-        if trade_status not in ("CONFIRMED", "MATCHED", "MINED"):
-            # Not yet settled — skip unresolved trades
-            outcome = "UNRESOLVED"
-        elif outcome_token == "YES":
+        if outcome_token == "YES":
             if side == "BUY":
                 outcome = "WIN"
                 pnl = size * (1.0 - price)
@@ -95,17 +92,17 @@ def _parse_trade(raw: dict, address: str) -> TradeRecord | None:
         else:
             outcome = "UNRESOLVED"
 
-        # match_time is a Unix second string
-        ts_raw = raw.get("match_time") or raw.get("timestamp") or 0
+        # timestamp is a Unix integer (seconds)
+        ts_raw = raw.get("timestamp") or 0
         try:
             ts = int(float(ts_raw)) * 1000  # normalise to milliseconds
         except (TypeError, ValueError):
             ts = 0
 
         return TradeRecord(
-            trade_id=str(raw.get("id", "")),
-            market_id=str(raw.get("market", "")),
-            token_id=str(raw.get("asset_id", "")),
+            trade_id=str(raw.get("transactionHash", "")),
+            market_id=str(raw.get("conditionId", "")),
+            token_id=str(raw.get("asset", "")),
             side=side,
             price=price,
             size=size,
@@ -241,22 +238,26 @@ class WhaleFetcher:
         address: str,
         sem: asyncio.Semaphore,
     ) -> WalletProfile | None:
-        """Fetch all available trade history for one wallet."""
+        """
+        Fetch all available trade history for one wallet.
+
+        Uses data-api.polymarket.com/trades?user=<address>&limit=N&offset=N.
+        This endpoint is public (no auth), returns a plain list sorted by
+        timestamp descending, and uses offset-based pagination.
+        """
         async with sem:
             profile = WalletProfile(address=address)
             page_size = 500
-            # /data/trades uses cursor-based pagination (not offset).
-            # Initial cursor is "MA==" (base64 of "0"); empty string also works.
-            cursor = "MA=="
+            offset = 0
 
             while True:
                 try:
                     data = await self._get_json(
-                        f"{cfg.clob_url}/data/trades",
+                        f"{cfg.data_url}/trades",
                         params={
-                            "maker_address": address,
+                            "user": address,
                             "limit": page_size,
-                            "next_cursor": cursor,
+                            "offset": offset,
                         },
                     )
                 except Exception as exc:
@@ -264,12 +265,10 @@ class WhaleFetcher:
                     break
 
                 trades_raw: list[dict] = []
-                next_cursor: str | None = None
                 if isinstance(data, list):
                     trades_raw = data
                 elif isinstance(data, dict):
                     trades_raw = data.get("data", data.get("trades", []))
-                    next_cursor = data.get("next_cursor")
 
                 if not trades_raw:
                     break
@@ -279,10 +278,10 @@ class WhaleFetcher:
                     if t:
                         profile.trades.append(t)
 
-                # Advance cursor; stop when API signals last page
-                if not next_cursor or next_cursor == cursor or len(trades_raw) < page_size:
+                # Advance offset; stop when the page is not full (last page)
+                if len(trades_raw) < page_size:
                     break
-                cursor = next_cursor
+                offset += len(trades_raw)
 
             if profile.trades:
                 profile.total_volume_usdc = sum(t.size for t in profile.trades)
@@ -340,14 +339,19 @@ class WhaleFetcher:
         """
         Fetch trades placed by `maker_address` after `after_ts_sec` (Unix seconds).
         Used by WhalePollWatcher to detect new whale trades in near-real-time.
-        Returns a list of raw trade dicts from /data/trades.
+
+        Uses data-api.polymarket.com/trades?user=<address> (public, no auth).
+        The API does not support server-side timestamp filtering, so we fetch the
+        latest 50 trades and filter client-side — fine because whales don't trade
+        50 times in the 2-second poll window.
+
+        Field names: asset (token_id), conditionId (market_id), timestamp (unix sec)
         """
         try:
             data = await self._get_json(
-                f"{cfg.clob_url}/data/trades",
+                f"{cfg.data_url}/trades",
                 params={
-                    "maker_address": maker_address,
-                    "after": after_ts_sec,
+                    "user": maker_address,
                     "limit": 50,
                 },
             )
@@ -355,32 +359,31 @@ class WhaleFetcher:
             logger.debug("get_recent_trades failed for %s: %s", maker_address, exc)
             return []
 
+        trades: list[dict]
         if isinstance(data, list):
-            return data
-        if isinstance(data, dict):
-            return data.get("data", data.get("trades", []))
-        return []
+            trades = data
+        elif isinstance(data, dict):
+            trades = data.get("data", data.get("trades", []))
+        else:
+            return []
+
+        # Filter client-side: only return trades newer than after_ts_sec
+        return [t for t in trades if int(float(t.get("timestamp") or 0)) > after_ts_sec]
 
     async def get_clob_market(self, condition_id: str) -> dict | None:
         """
         Fetch a single CLOB market by condition_id.
         Returns the market dict (includes tokens[].winner for resolution) or None.
 
-        Endpoint: GET /markets?condition_id=<id>  (not /markets/{id} — that path
-        doesn't exist on the CLOB). The response is a list; we return the first item.
+        Endpoint: GET /markets/{condition_id} — returns the market object directly.
+        (Confirmed working; GET /markets?condition_id=<id> returns 1000 results with
+        the target market first, which is fragile — direct lookup is authoritative.)
         """
         try:
             data = await self._get_json(
-                f"{cfg.clob_url}/markets",
-                params={"condition_id": condition_id},
+                f"{cfg.clob_url}/markets/{condition_id}",
             )
-            # /markets returns a paginated object: {"data": [...], "next_cursor": "..."}
-            markets: list[dict] = []
-            if isinstance(data, list):
-                markets = data
-            elif isinstance(data, dict):
-                markets = data.get("data", data.get("markets", []))
-            return markets[0] if markets else None
+            return data if isinstance(data, dict) else None
         except Exception as exc:
             logger.debug("get_clob_market failed for %s: %s", condition_id, exc)
             return None
