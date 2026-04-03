@@ -22,8 +22,6 @@ import logging
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-import aiohttp
-
 from config import cfg
 from edge_scanner.scanner import EdgeScanner
 from whale_analyzer.fetcher import WhaleFetcher
@@ -53,8 +51,6 @@ class TradeExecutor:
         self._scanner = EdgeScanner(fetcher, bankroll_usdc)
         self._order_manager = order_manager
         self._bankroll = bankroll_usdc or cfg.bankroll_usdc
-        # Cache session reference from fetcher to avoid attribute lookup overhead
-        self._session: aiohttp.ClientSession | None = None
         self._fetcher = fetcher
 
         # Simple in-process dedup: token_id → last signal ts (ms)
@@ -80,11 +76,10 @@ class TradeExecutor:
                 )
                 logger.info("ClobClient initialised.")
             except ImportError:
-                logger.info("py_clob_client not installed — will use raw HTTP fallback.")
-
-    def attach_session(self, session: aiohttp.ClientSession) -> None:
-        """Called after the aiohttp session is ready."""
-        self._session = session
+                logger.warning(
+                    "py_clob_client not installed — bot cannot place orders. "
+                    "Install with: pip install py-clob-client>=0.16.0"
+                )
 
     async def sync_bankroll(self) -> float:
         """
@@ -99,13 +94,17 @@ class TradeExecutor:
             return self._bankroll
 
         try:
+            from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+            params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
             loop = asyncio.get_running_loop()
-            raw = await loop.run_in_executor(self._clob_executor, self._clob_client.get_balance)
+            raw = await loop.run_in_executor(
+                self._clob_executor,
+                lambda: self._clob_client.get_balance_allowance(params),
+            )
 
-            # get_balance() returns a string like "150.23" or a dict;
-            # normalise to float
+            # get_balance_allowance returns a dict: {"balance": "150.23", "allowance": "..."}
             if isinstance(raw, dict):
-                usdc = float(raw.get("balance", raw.get("usdc", 0)))
+                usdc = float(raw.get("balance", 0))
             else:
                 usdc = float(raw)
 

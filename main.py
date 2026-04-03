@@ -118,8 +118,6 @@ async def _main() -> None:
             order_manager=order_manager,
             bankroll_usdc=cfg.bankroll_usdc,
         )
-        # Give executor a reference to the shared HTTP session
-        executor.attach_session(fetcher._session)
 
         # Fetch live balance and set bankroll before the bot starts trading
         opening_balance = await executor.sync_bankroll()

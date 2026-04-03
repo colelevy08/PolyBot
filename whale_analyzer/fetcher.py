@@ -39,17 +39,18 @@ class _TokenBucket:
         self._lock = asyncio.Lock()
 
     async def acquire(self) -> None:
-        async with self._lock:
-            now = time.monotonic()
-            elapsed = now - self._last_refill
-            self._tokens = min(self._rate, self._tokens + elapsed * self._rate)
-            self._last_refill = now
-            if self._tokens < 1.0:
+        while True:
+            async with self._lock:
+                now = time.monotonic()
+                elapsed = now - self._last_refill
+                self._tokens = min(self._rate, self._tokens + elapsed * self._rate)
+                self._last_refill = now
+                if self._tokens >= 1.0:
+                    self._tokens -= 1.0
+                    return
                 wait = (1.0 - self._tokens) / self._rate
-                await asyncio.sleep(wait)
-                self._tokens = 0.0
-            else:
-                self._tokens -= 1.0
+            # Release lock before sleeping so other callers can check/refill
+            await asyncio.sleep(wait)
 
 
 def _parse_trade(raw: dict, address: str) -> TradeRecord | None:
