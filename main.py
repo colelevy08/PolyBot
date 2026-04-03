@@ -10,7 +10,7 @@ Prerequisites:
 Pipeline:
   1. Load top whale addresses from data/whales.json (re-analyse if stale).
   2. Initialise aiohttp session, EdgeScanner, TradeExecutor, OrderManager.
-  3. WhalePollWatcher polls /data/trades for each whale every 2s.
+  3. WhalePollWatcher polls data-api.polymarket.com/trades per whale every 2s.
   4. On each new whale trade → EdgeScanner (live orderbook) → Kelly size → CLOB order.
   5. PositionMonitor polls CLOB /markets every 5min for resolution.
   6. Stats logged every 60 seconds; state persisted on shutdown.

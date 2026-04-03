@@ -66,20 +66,28 @@ class TradeExecutor:
         if cfg.poly_api_key:
             try:
                 from py_clob_client.client import ClobClient
-                self._clob_client = ClobClient(
-                    host=cfg.clob_url,
-                    chain_id=cfg.chain_id,
-                    private_key=cfg.poly_private_key,
+                from py_clob_client.clob_types import ApiCreds
+                creds = ApiCreds(
                     api_key=cfg.poly_api_key,
                     api_secret=cfg.poly_api_secret,
                     api_passphrase=cfg.poly_api_passphrase,
                 )
-                logger.info("ClobClient initialised.")
+                # ClobClient constructor: key= (not private_key=), creds= ApiCreds object.
+                # signature_type=0 is the default for EOA/standard private-key wallets.
+                self._clob_client = ClobClient(
+                    cfg.clob_url,
+                    key=cfg.poly_private_key,
+                    chain_id=cfg.chain_id,
+                    creds=creds,
+                )
+                logger.info("ClobClient initialised (L2 auth).")
             except ImportError:
                 logger.warning(
                     "py_clob_client not installed — bot cannot place orders. "
                     "Install with: pip install py-clob-client>=0.16.0"
                 )
+            except Exception as exc:
+                logger.error("ClobClient init failed: %s", exc)
 
     async def sync_bankroll(self) -> float:
         """
