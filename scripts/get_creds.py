@@ -36,10 +36,11 @@ def main() -> None:
 
     print("\nConnecting to Polymarket CLOB...")
     try:
+        # L1 auth: only key + chain_id required (no API creds yet — we're deriving them)
         client = ClobClient(
-            host="https://clob.polymarket.com",
+            "https://clob.polymarket.com",
+            key=private_key,
             chain_id=137,
-            private_key=private_key,
         )
         creds = client.create_or_derive_api_creds()
     except Exception as exc:

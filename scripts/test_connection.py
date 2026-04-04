@@ -46,33 +46,41 @@ def check_clob() -> bool:
         return False
 
     try:
-        client = ClobClient(
-            host="https://clob.polymarket.com",
-            chain_id=137,
-            private_key=os.getenv("POLY_PRIVATE_KEY"),
+        from py_clob_client.clob_types import ApiCreds, BalanceAllowanceParams, AssetType
+        creds = ApiCreds(
             api_key=os.getenv("POLY_API_KEY"),
             api_secret=os.getenv("POLY_API_SECRET"),
             api_passphrase=os.getenv("POLY_API_PASSPHRASE"),
+        )
+        # key= (not private_key=); creds= ApiCreds object (not separate kwargs)
+        client = ClobClient(
+            "https://clob.polymarket.com",
+            key=os.getenv("POLY_PRIVATE_KEY"),
+            chain_id=137,
+            creds=creds,
         )
     except Exception as exc:
         print(f"ERROR: ClobClient init failed — {exc}")
         return False
 
-    # Markets
+    # Health check + markets
     try:
+        client.get_ok()
         markets = client.get_markets()
-        count = len(markets.data) if hasattr(markets, "data") else "?"
+        count = len(markets.get("data", [])) if isinstance(markets, dict) else "?"
         print(f"✓ CLOB connected — {count} markets available")
     except Exception as exc:
-        print(f"ERROR: get_markets() failed — {exc}")
+        print(f"ERROR: CLOB connectivity failed — {exc}")
         return False
 
-    # Balance
+    # Balance (get_balance_allowance — get_balance() does not exist on ClobClient)
     try:
-        bal = client.get_balance()
-        print(f"✓ Balance: {bal}")
+        params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+        raw = client.get_balance_allowance(params)
+        bal = raw.get("balance", "?") if isinstance(raw, dict) else raw
+        print(f"✓ Balance: {bal} USDC")
     except Exception as exc:
-        # Balance endpoint may require funded account; non-fatal
+        # Balance endpoint requires funded account with proper allowances; non-fatal
         print(f"  Balance check skipped ({exc})")
 
     return True
